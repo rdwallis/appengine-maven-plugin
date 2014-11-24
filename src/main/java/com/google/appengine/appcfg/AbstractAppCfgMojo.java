@@ -3,28 +3,55 @@
  */
 package com.google.appengine.appcfg;
 
-import com.google.appengine.SdkResolver;
-import com.google.appengine.tools.admin.AppCfg;
-import com.google.common.base.Joiner;
+import static org.codehaus.plexus.util.StringUtils.isNotEmpty;
+
+import java.io.BufferedWriter;
+import java.io.File;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.io.OutputStreamWriter;
+import java.io.PipedInputStream;
+import java.io.PipedOutputStream;
+import java.io.PrintStream;
+import java.lang.reflect.Method;
+import java.util.ArrayList;
+import java.util.List;
 
 import org.apache.maven.plugin.AbstractMojo;
 import org.apache.maven.plugin.MojoExecutionException;
 import org.apache.maven.project.MavenProject;
+import org.apache.maven.settings.Server;
+import org.apache.maven.settings.Settings;
+import org.codehaus.plexus.PlexusConstants;
+import org.codehaus.plexus.PlexusContainer;
+import org.codehaus.plexus.context.Context;
+import org.codehaus.plexus.context.ContextException;
+import org.codehaus.plexus.personality.plexus.lifecycle.phase.Contextualizable;
 import org.eclipse.aether.RepositorySystem;
 import org.eclipse.aether.RepositorySystemSession;
 import org.eclipse.aether.repository.RemoteRepository;
 
-import java.io.File;
-import java.io.IOException;
-import java.util.ArrayList;
-import java.util.List;
+import com.google.appengine.SdkResolver;
+import com.google.appengine.tools.admin.AppCfg;
+import com.google.common.base.Joiner;
 
 /**
  * Abstract class for supporting appcfg commands.
  *
  * @author Matt Stephenson <mattstep@google.com>
  */
-public abstract class AbstractAppCfgMojo extends AbstractMojo {
+public abstract class AbstractAppCfgMojo extends AbstractMojo implements Contextualizable {
+
+  private static final String SECURITY_DISPATCHER_CLASS_NAME = "org.sonatype.plexus.components.sec.dispatcher.SecDispatcher";
+
+  /**
+   * Plexus container, needed to manually lookup components.
+   * 
+   * To be able to use Password Encryption
+   * http://maven.apache.org/guides/mini/guide-encryption.html
+   */
+  protected PlexusContainer container;
 
   /**
    * The entry point to Aether, i.e. the component doing all the work.
@@ -43,7 +70,17 @@ public abstract class AbstractAppCfgMojo extends AbstractMojo {
   protected RepositorySystemSession repoSession;
 
   /**
-   * The project's remote repositories to use for the resolution of project dependencies.
+   * The Maven settings reference.
+   * 
+   * @parameter expression="${settings}"
+   * @required
+   * @readonly
+   */
+  protected Settings settings;
+
+  /**
+   * The project's remote repositories to use for the resolution of project
+   * dependencies.
    *
    * @parameter default-value="${project.remoteProjectRepositories}"
    * @readonly
@@ -51,7 +88,8 @@ public abstract class AbstractAppCfgMojo extends AbstractMojo {
   protected List<RemoteRepository> projectRepos;
 
   /**
-   * The project's remote repositories to use for the resolution of plugins and their dependencies.
+   * The project's remote repositories to use for the resolution of plugins and
+   * their dependencies.
    *
    * @parameter default-value="${project.remotePluginRepositories}"
    * @readonly
@@ -66,10 +104,22 @@ public abstract class AbstractAppCfgMojo extends AbstractMojo {
   protected String server;
 
   /**
+   * The server id in maven settings.xml to use for emailAccount(username) and
+   * password when connecting to GAE.
+   * 
+   * If password present in settings "--passin" is set automatically.
+   * 
+   * @parameter expression="${gae.serverId}"
+   */
+  protected String serverId;
+
+  /**
    * The username to use.
    *
    * @parameter expression="${appengine.email}"
+   * @deprecated use maven settings.xml/server/username and "serverId" parameter
    */
+  @Deprecated
   protected String email;
 
   /**
@@ -80,8 +130,8 @@ public abstract class AbstractAppCfgMojo extends AbstractMojo {
   protected String host;
 
   /**
-   * Proxies requests through the given proxy server. If --proxy_https is also set, only HTTP will
-   * be proxied here, otherwise both HTTP and HTTPS will.
+   * Proxies requests through the given proxy server. If --proxy_https is also
+   * set, only HTTP will be proxied here, otherwise both HTTP and HTTPS will.
    *
    * @parameter expression="${appengine.proxyHost}"
    */
@@ -130,12 +180,11 @@ public abstract class AbstractAppCfgMojo extends AbstractMojo {
   protected String version;
 
   /**
-   * Use OAuth2 instead of password auth.  Defaults to true.
+   * Use OAuth2 instead of password auth. Defaults to true.
    *
    * @parameter default-value=true expression="${appengine.oauth2}"
    */
   protected boolean oauth2;
-
 
   /**
    * Split large jar files (> 10M) into smaller fragments.
@@ -145,8 +194,8 @@ public abstract class AbstractAppCfgMojo extends AbstractMojo {
   protected boolean enableJarSplitting;
 
   /**
-   * When --enable-jar-splitting is set, files that match the list of comma separated SUFFIXES will
-   * be excluded from all jars.
+   * When --enable-jar-splitting is set, files that match the list of comma
+   * separated SUFFIXES will be excluded from all jars.
    *
    * @parameter expression="${appengine.jarSplittingExcludes}"
    */
@@ -167,16 +216,16 @@ public abstract class AbstractAppCfgMojo extends AbstractMojo {
   protected boolean compileEncoding;
 
   /**
-   * Number of days worth of log data to get. The cut-off point is midnight UTC. Use 0 to get all
-   * available logs. Default is 1.
+   * Number of days worth of log data to get. The cut-off point is midnight UTC.
+   * Use 0 to get all available logs. Default is 1.
    *
    * @parameter expression="${appengine.numDays}"
    */
   protected Integer numDays;
 
   /**
-   * Severity of app-level log messages to get. The range is 0 (DEBUG) through 4 (CRITICAL). If
-   * omitted, only request logs are returned.
+   * Severity of app-level log messages to get. The range is 0 (DEBUG) through 4
+   * (CRITICAL). If omitted, only request logs are returned.
    *
    * @parameter expression="${appengine.severity}"
    */
@@ -230,7 +279,7 @@ public abstract class AbstractAppCfgMojo extends AbstractMojo {
    * @readonly
    */
   protected MavenProject project;
-  
+
   /**
    * Instance id to for vm debug.
    *
@@ -238,47 +287,23 @@ public abstract class AbstractAppCfgMojo extends AbstractMojo {
    */
   protected String instance;
 
-  protected void executeAppCfgCommand(String action, String appDir)
-      throws MojoExecutionException {
-    ArrayList<String> arguments = collectParameters();
-
-    arguments.add(action);
-    arguments.add(appDir);
-    getLog().info("Running " + Joiner.on(" ").join(arguments));
-
-    try {
-      AppCfg.main(arguments.toArray(new String[arguments.size()]));
-    } catch (Exception ex) {
-      throw new MojoExecutionException("Error executing appcfg command="
-          + arguments, ex);
-    }
+  @Override
+  public void contextualize(final Context context) throws ContextException {
+    container = (PlexusContainer) context.get(PlexusConstants.PLEXUS_KEY);
   }
 
-  protected void executeAppCfgBackendsCommand(String action, String appDir)
-      throws MojoExecutionException {
-    ArrayList<String> arguments = collectParameters();
-
-    arguments.add("backends");
-    arguments.add(action);
-    arguments.add(appDir);
-    arguments.add(backendName);
-    try {
-      AppCfg.main(arguments.toArray(new String[arguments.size()]));
-    } catch (Exception ex) {
-      throw new MojoExecutionException("Error executing appcfg command="
-          + arguments, ex);
-    }
-  }
-
-  protected ArrayList<String> collectParameters() {
-    ArrayList<String> arguments = new ArrayList<String>();
+  protected List<String> collectParameters() {
+    List<String> arguments = new ArrayList<String>();
 
     if (server != null && !server.isEmpty()) {
       arguments.add("-s");
       arguments.add(server);
     }
 
-    if (email != null && !email.isEmpty()) {
+    if (getServerSettings() != null) {
+      arguments.add("-e");
+      arguments.add(getServerSettings().getUsername());
+    } else if (email != null && !email.isEmpty()) {
       arguments.add("-e");
       arguments.add(email);
     }
@@ -300,7 +325,7 @@ public abstract class AbstractAppCfgMojo extends AbstractMojo {
       arguments.add("--no_cookies");
     }
 
-    if (passin) {
+    if (passin || getServerSettings() != null) {
       arguments.add("--passin");
     }
 
@@ -317,8 +342,8 @@ public abstract class AbstractAppCfgMojo extends AbstractMojo {
       arguments.add("-V");
       arguments.add(version);
     }
-    
-    if (oauth2) {
+
+    if (oauth2 && getServerSettings() == null) {
       arguments.add("--oauth2");
     }
 
@@ -369,14 +394,118 @@ public abstract class AbstractAppCfgMojo extends AbstractMojo {
     return arguments;
   }
 
-  protected void resolveAndSetSdkRoot() throws MojoExecutionException {
+  protected void executeAppCfgCommand(String action, String appDir) throws MojoExecutionException {
+    List<String> arguments = collectParameters();
 
+    arguments.add(action);
+    arguments.add(appDir);
+    executeAppCfg(arguments);
+  }
+
+  protected void executeAppCfgBackendsCommand(String action, String appDir) throws MojoExecutionException {
+    List<String> arguments = collectParameters();
+
+    arguments.add("backends");
+    arguments.add(action);
+    arguments.add(appDir);
+    arguments.add(backendName);
+    executeAppCfg(arguments);
+  }
+
+  protected void resolveAndSetSdkRoot() throws MojoExecutionException {
     File sdkBaseDir = SdkResolver.getSdk(project, repoSystem, repoSession, pluginRepos, projectRepos);
 
     try {
       System.setProperty("appengine.sdk.root", sdkBaseDir.getCanonicalPath());
     } catch (IOException e) {
       throw new MojoExecutionException("Could not open SDK zip archive.", e);
+    }
+  }
+
+  private void executeAppCfg(List<String> arguments) throws MojoExecutionException {
+    getLog().info("Running " + Joiner.on(" ").join(arguments));
+    String[] arg = arguments.toArray(new String[arguments.size()]);
+    if (getServerSettings() != null) {
+      forkPasswordExpectThread(arg, decryptPassword(getServerSettings().getPassword()));
+    } else {
+      try {
+        AppCfg.main(arg);
+      } catch (Exception ex) {
+        throw new MojoExecutionException("Error executing appcfg command=" + arguments, ex);
+      }
+    }
+  }
+
+  private void forkPasswordExpectThread(final String[] args, final String password) {
+    getLog().info("Use Settings configuration from server id {" + serverId + "}");
+    // Parent for all threads created by AppCfg
+    final ThreadGroup threads = new ThreadGroup("AppCfgThreadGroup");
+
+    // Main execution Thread that belong to ThreadGroup threads
+    final Thread thread = new Thread(threads, "AppCfgMainThread") {
+
+      @Override
+      public void run() {
+        final PrintStream outOrig = System.out;
+        final InputStream inOrig = System.in;
+
+        try (PipedInputStream inReplace = new PipedInputStream(); OutputStream stdin = new PipedOutputStream(inReplace); ) {
+          System.setIn(inReplace);
+          
+
+          System.setOut(new PrintStream(new PasswordExpectOutputStream(threads, outOrig, new Runnable() {
+            @Override
+            public void run() {
+              try (BufferedWriter stdinWriter = new BufferedWriter(new OutputStreamWriter(stdin))){
+                stdinWriter.write(password);
+                stdinWriter.newLine();
+                stdinWriter.flush();
+              } catch (final IOException e) {
+                getLog().error("Unable to enter password", e);
+              }
+            }
+          }), true));
+          AppCfg.main(args);
+        } catch (IOException e) {
+          getLog().error("Unable to redirect output", e);
+        } catch (Throwable e) {
+          getLog().error("Unable to execute AppCfg", e);
+        } finally {
+          System.setOut(outOrig);
+          System.setIn(inOrig);
+        }
+      }
+    };
+    thread.start();
+    try {
+      thread.join();
+    } catch (final InterruptedException e) {
+      getLog().error("Interrupted waiting for process supervisor thread to finish", e);
+    }
+  }
+
+  private String decryptPassword(final String password) {
+    if (isNotEmpty(password)) {
+      try {
+        final Class<?> securityDispatcherClass = container.getClass().getClassLoader().loadClass(SECURITY_DISPATCHER_CLASS_NAME);
+        final Object securityDispatcher = container.lookup(SECURITY_DISPATCHER_CLASS_NAME, "maven");
+        final Method decrypt = securityDispatcherClass.getMethod("decrypt", String.class);
+
+        return (String) decrypt.invoke(securityDispatcher, password);
+
+      } catch (final Exception e) {
+        getLog().warn("security features are disabled. Cannot find plexus security dispatcher", e);
+      }
+    }
+    getLog().debug("password could not be decrypted");
+    return password;
+  }
+
+  private Server getServerSettings() {
+    if (serverId != null && !serverId.isEmpty()) {
+      return settings.getServer(serverId);
+    } else {
+      return null;
     }
   }
 }
